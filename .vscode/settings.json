@@ -1,0 +1,10 @@
+{
+  "idf.currentSetup": "c:\\Espressif\\frameworks\\esp-idf-v5.3",
+  "idf.customExtraVars": {},
+  "clangd.path": "c:\\Espressif\\tools\\tools\\esp-clang\\esp-18.1.2_20240912\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\Sjors\\OneDrive\\Project\\esp32-bt2ps2-0.7-beta\\build"
+  ]
+}
