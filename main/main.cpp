@@ -822,8 +822,12 @@ void ble_connection_daemon(void *arg)
         {
             if (BTKeyboard::isConnected)
             {
+                // Keep a low-frequency background scan so additional bonded HID devices
+                // (e.g. mouse after keyboard) can still connect without destabilizing links.
+                bleNowScanning = true;
+                bt_keyboard.devices_scan_ble_daemon(2);
                 bleNowScanning = false;
-                vTaskDelay(2000 / portTICK_PERIOD_MS);
+                vTaskDelay(10000 / portTICK_PERIOD_MS);
                 continue;
             }
 
