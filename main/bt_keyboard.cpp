@@ -646,10 +646,17 @@ void BTKeyboard::handle_ble_device_result(esp_ble_gap_cb_param_t *param)
 {
   uint16_t uuid = 0;
   uint16_t appearance = 0;
+  esp_hid_usage_t adv_usage = ESP_HID_USAGE_GENERIC;
   char name[64] = "";
 
   uint8_t uuid_len = 0;
   uint8_t *uuid_d = esp_ble_resolve_adv_data(param->scan_rst.ble_adv, ESP_BLE_AD_TYPE_16SRV_CMPL, &uuid_len);
+
+  if (uuid_d == nullptr || !uuid_len)
+  {
+    // Some devices only advertise partial 16-bit service UUIDs.
+    uuid_d = esp_ble_resolve_adv_data(param->scan_rst.ble_adv, ESP_BLE_AD_TYPE_16SRV_PART, &uuid_len);
+  }
 
   if (uuid_d != nullptr && uuid_len)
   {
@@ -662,6 +669,7 @@ void BTKeyboard::handle_ble_device_result(esp_ble_gap_cb_param_t *param)
   if (appearance_d != nullptr && appearance_len)
   {
     appearance = appearance_d[0] + (appearance_d[1] << 8);
+    adv_usage = esp_hid_usage_from_appearance(appearance);
   }
 
   uint8_t adv_name_len = 0;
@@ -720,7 +728,11 @@ void BTKeyboard::handle_ble_device_result(esp_ble_gap_cb_param_t *param)
     }
   }
 
-  if (uuid == ESP_GATT_UUID_HID_SVC || isLastBonded == true)
+  const bool looks_like_hid = (uuid == ESP_GATT_UUID_HID_SVC) ||
+                              (adv_usage == ESP_HID_USAGE_KEYBOARD) ||
+                              (adv_usage == ESP_HID_USAGE_MOUSE);
+
+  if (looks_like_hid || isLastBonded == true)
   {
     add_ble_scan_result(param->scan_rst.bda,
                         param->scan_rst.ble_addr_type,
@@ -1100,6 +1112,7 @@ bool BTKeyboard::devices_scan_ble_daemon(int seconds_wait_time)
 {
   size_t results_len = 0;
   esp_hid_scan_result_t *results = NULL;
+  bool opened_device = false;
 
   ESP_LOGV(TAG, "SCAN DAEMON...");
 
@@ -1145,6 +1158,7 @@ bool BTKeyboard::devices_scan_ble_daemon(int seconds_wait_time)
           if (esp_hidh_dev_open(r->bda, r->transport, r->ble.addr_type) != NULL)
           {
             ESP_LOGI(TAG, "Connected to device: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(r->bda));
+            opened_device = true;
           }
           else
           {
@@ -1156,14 +1170,33 @@ bool BTKeyboard::devices_scan_ble_daemon(int seconds_wait_time)
       }
       r = r->next;
     }
-    esp_hid_scan_results_free(results);
-    free(dev_list);
-    return true; // WARNING: devices_scan retourning true doesn't mean device connected!! check isConnected for that
+  }
+
+  // If no bonded device was opened, allow one nearby BLE mouse to connect.
+  // This enables keyboard+mouse setups where the keyboard is already connected
+  // and a mouse enters pairing mode later.
+  if (results_len && !opened_device)
+  {
+    esp_hid_scan_result_t *r = results;
+    while (r)
+    {
+      if ((r->transport == ESP_HID_TRANSPORT_BLE) && (r->usage == ESP_HID_USAGE_MOUSE))
+      {
+        ESP_LOGI(TAG, "Trying BLE mouse candidate: " ESP_BD_ADDR_STR " RSSI:%d", ESP_BD_ADDR_HEX(r->bda), r->rssi);
+        if (esp_hidh_dev_open(r->bda, r->transport, r->ble.addr_type) != NULL)
+        {
+          ESP_LOGI(TAG, "Connected to BLE mouse: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(r->bda));
+          opened_device = true;
+          break;
+        }
+      }
+      r = r->next;
+    }
   }
 
   esp_hid_scan_results_free(results);
   free(dev_list);
-  return false;
+  return opened_device;
 }
 
 void BTKeyboard::hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
