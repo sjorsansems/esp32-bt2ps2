@@ -1,3 +1,16 @@
+PS/2 keyboard CLK: GPIO 22 - bruin
+PS/2 keyboard DATA: GPIO 23 - rood
+PS/2 mouse CLK: GPIO 26 - bruin
+PS/2 mouse DATA: GPIO 25 - rood
+VCC = Zwart
+Ground = Oranje
+Pairing knop: GPIO 27
+Status LED: GPIO 2
+Serial mouse RTS detect: GPIO 15
+Serial mouse TX (naar host RX): GPIO 4
+
+
+
 24/8/24: Mouse and Multimedia Key support is out for v0.6! Check notes on release
 
 Tested Bluetooth Keyboards and Mice (Please add your own!): https://1drv.ms/x/s!AlKre4_rNmpJiYpl1v4KcbK1Pm77zA?e=0I6QRB

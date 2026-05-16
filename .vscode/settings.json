@@ -6,5 +6,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\Sjors\\OneDrive\\Project\\esp32-bt2ps2-0.7-beta\\build"
-  ]
+  ],
+  "idf.portWin": "COM7"
 }

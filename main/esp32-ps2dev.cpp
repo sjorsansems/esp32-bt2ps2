@@ -4,10 +4,55 @@
 #define LOW 0x0
 
 // Unomment following line to enable debug messages on the PS2DEV module
-//#define _ESP32_PS2DEV_DEBUG_
+#define _ESP32_PS2DEV_DEBUG_
 
 namespace esp32_ps2dev
 {
+  static constexpr uint64_t HOST_CMD_PARAM_TIMEOUT_MS = 1000;
+
+
+#if defined(_ESP32_PS2DEV_DEBUG_)
+  static const char *ps2_mouse_cmd_name(uint8_t cmd)
+  {
+    switch ((PS2Mouse::Command)cmd)
+    {
+    case PS2Mouse::Command::RESET:
+      return "RESET";
+    case PS2Mouse::Command::RESEND:
+      return "RESEND";
+    case PS2Mouse::Command::SET_DEFAULTS:
+      return "SET_DEFAULTS";
+    case PS2Mouse::Command::DISABLE_DATA_REPORTING:
+      return "DISABLE_DATA_REPORTING";
+    case PS2Mouse::Command::ENABLE_DATA_REPORTING:
+      return "ENABLE_DATA_REPORTING";
+    case PS2Mouse::Command::SET_SAMPLE_RATE:
+      return "SET_SAMPLE_RATE";
+    case PS2Mouse::Command::GET_DEVICE_ID:
+      return "GET_DEVICE_ID";
+    case PS2Mouse::Command::SET_REMOTE_MODE:
+      return "SET_REMOTE_MODE";
+    case PS2Mouse::Command::SET_WRAP_MODE:
+      return "SET_WRAP_MODE";
+    case PS2Mouse::Command::RESET_WRAP_MODE:
+      return "RESET_WRAP_MODE";
+    case PS2Mouse::Command::READ_DATA:
+      return "READ_DATA";
+    case PS2Mouse::Command::SET_STREAM_MODE:
+      return "SET_STREAM_MODE";
+    case PS2Mouse::Command::STATUS_REQUEST:
+      return "STATUS_REQUEST";
+    case PS2Mouse::Command::SET_RESOLUTION:
+      return "SET_RESOLUTION";
+    case PS2Mouse::Command::SET_SCALING_2_1:
+      return "SET_SCALING_2_1";
+    case PS2Mouse::Command::SET_SCALING_1_1:
+      return "SET_SCALING_1_1";
+    default:
+      return "UNKNOWN";
+    }
+  }
+#endif
 
   // THIS SECTION DEFINES THE FUNCTIONS USED BELOW AS IMPLEMENTED IN THE ARDUINO CORE FOR ESP32
   // THE CODE ON THIS FILE HAS BEEN PORTED FROM AN ARDUINO-IDE PROJECT SO THIS IS NECESSARY
@@ -124,9 +169,20 @@ namespace esp32_ps2dev
   }
   void PS2dev::ack()
   {
-    delayMicroseconds(BYTE_INTERVAL_MICROS);
-    write(0xFA);
-    delayMicroseconds(BYTE_INTERVAL_MICROS);
+    // Host command->ACK handshakes (e.g. E8/F3) are timing sensitive on some BIOSes.
+    // Retry a direct write quickly until the bus becomes IDLE and ACK is sent.
+    const uint64_t timeout_us = 25000;
+    const uint64_t start = micros();
+    while (write(0xFA) != 0)
+    {
+      if ((micros() - start) > timeout_us)
+      {
+        ESP_LOGW("PS2dev", "ACK write timed out");
+        break;
+      }
+      delayMicroseconds(CLK_QUATER_PERIOD_MICROS);
+    }
+    delayMicroseconds(CLK_HALF_PERIOD_MICROS);
   }
   int PS2dev::write(unsigned char data)
   {
@@ -215,13 +271,25 @@ namespace esp32_ps2dev
     unsigned char calculated_parity = 1;
     unsigned char received_parity = 0;
 
-    // wait for data line to go low and clock line to go high (or timeout)
-    unsigned long waiting_since = millis();
-    while (get_bus_state() != BusState::HOST_REQUEST_TO_SEND)
+    // Synchronize to host request in two phases:
+    // 1) host pulls DATA low, 2) host releases CLK high so device can clock bits.
+    // This is more robust than waiting on a single bus state and avoids missing
+    // short transitions on some BIOS/DOS controllers.
+    unsigned long waiting_since_us = micros();
+    uint64_t timeout_us = timeout_ms ? (timeout_ms * 1000ULL) : 2000ULL;
+
+    while (digitalRead(_ps2data) != LOW)
     {
-      if ((millis() - waiting_since) > timeout_ms)
+      if ((micros() - waiting_since_us) > timeout_us)
         return -1;
-      delay(1);
+      delayMicroseconds(CLK_QUATER_PERIOD_MICROS);
+    }
+
+    while (digitalRead(_ps2clk) == LOW)
+    {
+      if ((micros() - waiting_since_us) > timeout_us)
+        return -1;
+      delayMicroseconds(CLK_QUATER_PERIOD_MICROS);
     }
 
     portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -314,6 +382,11 @@ namespace esp32_ps2dev
   {
     PS2dev::begin(DEFAULT_TASK_CORE_MOUSE);
 
+    // Keep DOS compatibility high by defaulting to a plain 3-byte PS/2 mouse.
+    // Wheel / 4-5 button emulation can desync older drivers like CuteMouse.
+    _has_wheel = false;
+    _has_4th_and_5th_buttons = false;
+
     auto ret = nvs_flash_init();
     if (ret != ESP_OK)
     {
@@ -351,7 +424,34 @@ namespace esp32_ps2dev
   }
   int PS2Mouse::reply_to_host(uint8_t host_cmd)
   {
-    uint8_t val;
+#if defined(_ESP32_PS2DEV_DEBUG_)
+    ESP_LOGI(TAG, "Host -> Mouse cmd=0x%02X (%s)", host_cmd, ps2_mouse_cmd_name(host_cmd));
+#endif
+    if (_pending_param == PendingParam::SET_SAMPLE_RATE)
+    {
+      // Parameter byte following F3 (set sample rate)
+      _sample_rate = (host_cmd >= 10) ? host_cmd : 100;
+      _last_sample_rate[0] = _last_sample_rate[1];
+      _last_sample_rate[1] = _last_sample_rate[2];
+      _last_sample_rate[2] = host_cmd;
+      ack();
+      _save_internal_state_to_nvs();
+      reset_counter();
+      _pending_param = PendingParam::NONE;
+      return 0;
+    }
+
+    if (_pending_param == PendingParam::SET_RESOLUTION)
+    {
+      // Parameter byte following E8 (set resolution)
+      _resolution = (ResolutionCode)(host_cmd & 0x03);
+      ack();
+      _save_internal_state_to_nvs();
+      reset_counter();
+      _pending_param = PendingParam::NONE;
+      return 0;
+    }
+
     if (_mode == Mode::WRAP_MODE)
     {
       switch ((Command)host_cmd)
@@ -394,6 +494,10 @@ namespace esp32_ps2dev
       _has_wheel = false;
       _has_4th_and_5th_buttons = false;
       _sample_rate = 100;
+      _last_sample_rate[0] = 0;
+      _last_sample_rate[1] = 0;
+      _last_sample_rate[2] = 0;
+      _pending_param = PendingParam::NONE;
       _resolution = ResolutionCode::RES_4;
       _scale = Scale::ONE_ONE;
       _data_reporting_enabled = false;
@@ -414,6 +518,10 @@ namespace esp32_ps2dev
       // enter stream mode
       ack();
       _sample_rate = 100;
+      _last_sample_rate[0] = 0;
+      _last_sample_rate[1] = 0;
+      _last_sample_rate[2] = 0;
+      _pending_param = PendingParam::NONE;
       _resolution = ResolutionCode::RES_4;
       _scale = Scale::ONE_ONE;
       _data_reporting_enabled = false;
@@ -441,69 +549,20 @@ namespace esp32_ps2dev
       break;
     case Command::SET_SAMPLE_RATE: // set sample rate
       ack();
-      if (read(&val) == 0)
-      {
-        switch (val)
-        {
-        case 10:
-        case 20:
-        case 40:
-        case 60:
-        case 80:
-        case 100:
-        case 200:
-          _sample_rate = val;
-          _last_sample_rate[0] = _last_sample_rate[1];
-          _last_sample_rate[1] = _last_sample_rate[2];
-          _last_sample_rate[2] = val;
-#if defined(_ESP32_PS2DEV_DEBUG_)
-          printf("Set sample rate command received: %x", val);
-          //_ESP32_PS2DEV_DEBUG_.println(val);
-#endif
-          ack();
-          break;
-
-        default:
-          break;
-        }
-        _save_internal_state_to_nvs();
-        // _min_report_interval_us = 1000000 / sample_rate;
-        reset_counter();
-      }
+      _pending_param = PendingParam::SET_SAMPLE_RATE;
       break;
     case Command::GET_DEVICE_ID: // get device id
 #if defined(_ESP32_PS2DEV_DEBUG_)
       printf("PS2Mouse::reply_to_host: Get device id command received");
 #endif
       ack();
-      if (_last_sample_rate[0] == 200 && _last_sample_rate[1] == 100 && _last_sample_rate[2] == 80)
-      {
-        write(0x03); // Intellimouse with wheel
-#if defined(_ESP32_PS2DEV_DEBUG_)
-        printf("PS2Mouse::reply_to_host: Act as Intellimouse with wheel.");
-#endif
-        _has_wheel = true;
-        _save_internal_state_to_nvs();
-      }
-      else if (_last_sample_rate[0] == 200 && _last_sample_rate[1] == 200 && _last_sample_rate[2] == 80 && _has_wheel == true)
-      {
-        write(0x04); // Intellimouse with 4th and 5th buttons
-#if defined(_ESP32_PS2DEV_DEBUG_)
-        printf("PS2Mouse::reply_to_host: Act as Intellimouse with 4th and 5th buttons.");
-#endif
-        _has_4th_and_5th_buttons = true;
-        _save_internal_state_to_nvs();
-      }
-      else
-      {
-        write(0x00); // Standard PS/2 mouse
-#if defined(_ESP32_PS2DEV_DEBUG_)
-        printf("PS2Mouse::reply_to_host: Act as standard PS/2 mouse.");
-#endif
-        _has_wheel = false;
-        _has_4th_and_5th_buttons = false;
-        _save_internal_state_to_nvs();
-      }
+          write(0x00); // Standard PS/2 mouse for maximum DOS compatibility
+    #if defined(_ESP32_PS2DEV_DEBUG_)
+          printf("PS2Mouse::reply_to_host: Act as standard PS/2 mouse.");
+    #endif
+          _has_wheel = false;
+          _has_4th_and_5th_buttons = false;
+          _save_internal_state_to_nvs();
       reset_counter();
       break;
     case Command::SET_REMOTE_MODE: // set remote mode
@@ -550,6 +609,8 @@ namespace esp32_ps2dev
 #endif
       ack();
       reset_counter();
+      _mode = Mode::STREAM_MODE;
+      _save_internal_state_to_nvs();
       break;
     case Command::STATUS_REQUEST: // status request
 #if defined(_ESP32_PS2DEV_DEBUG_)
@@ -560,17 +621,7 @@ namespace esp32_ps2dev
       break;
     case Command::SET_RESOLUTION: // set resolution
       ack();
-      if (read(&val) == 0 && val <= 3)
-      {
-        _resolution = (ResolutionCode)val;
-#if defined(_ESP32_PS2DEV_DEBUG_)
-        printf("PS2Mouse::reply_to_host: Set resolution command received: %x", val);
-        //_ESP32_PS2DEV_DEBUG_.println(val, HEX);
-#endif
-        ack();
-        _save_internal_state_to_nvs();
-        reset_counter();
-      }
+      _pending_param = PendingParam::SET_RESOLUTION;
       break;
     case Command::SET_SCALING_2_1: // set scaling 2:1
 #if defined(_ESP32_PS2DEV_DEBUG_)
@@ -759,8 +810,8 @@ namespace esp32_ps2dev
     PS2Packet packet;
     packet.len = 3;
     bool mode = (_mode == Mode::REMOTE_MODE);
-    packet.data[0] = (_button_right & 1) & ((_button_middle & 1) << 1) & ((_button_left & 1) << 2) & ((0) << 3) &
-                     (((uint8_t)_scale & 1) << 4) & ((_data_reporting_enabled & 1) << 5) & ((mode & 1) << 6) & ((0) << 7);
+    packet.data[0] = (_button_right & 1) | ((_button_middle & 1) << 1) | ((_button_left & 1) << 2) |
+                     (((uint8_t)_scale & 1) << 4) | ((_data_reporting_enabled & 1) << 5) | ((mode & 1) << 6);
     packet.data[1] = (uint8_t)_resolution;
     packet.data[2] = _sample_rate;
     send_packet(&packet);

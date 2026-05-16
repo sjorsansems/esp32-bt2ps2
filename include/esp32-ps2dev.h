@@ -33,7 +33,7 @@ namespace esp32_ps2dev
   const BaseType_t DEFAULT_TASK_CORE = 0;
   const BaseType_t DEFAULT_TASK_CORE_MOUSE = 1;
   // The device should check for "HOST_REQUEST_TO_SEND" at a interval not exceeding 10 milliseconds.
-  const uint32_t INTERVAL_CHECKING_HOST_SEND_REQUEST_MILLIS = 9;
+  const uint32_t INTERVAL_CHECKING_HOST_SEND_REQUEST_MILLIS = 1;
   const uint32_t MOUSE_CLICK_PRESSING_DURATION_MILLIS = 100;
 
   class PS2Packet
@@ -148,6 +148,12 @@ namespace esp32_ps2dev
 
   protected:
     static constexpr char const *TAG = "PS2Mouse";
+    enum class PendingParam : uint8_t
+    {
+      NONE = 0,
+      SET_SAMPLE_RATE,
+      SET_RESOLUTION,
+    };
     void _send_status();
     void _save_internal_state_to_nvs();
     void _load_internal_state_from_nvs();
@@ -162,6 +168,7 @@ namespace esp32_ps2dev
     Mode _last_mode = Mode::STREAM_MODE;
     uint8_t _last_sample_rate[3] = {0, 0, 0};
     uint8_t _sample_rate = 100;
+    PendingParam _pending_param = PendingParam::NONE;
     int16_t _count_x = 0;
     uint8_t _count_x_overflow = 0;
     int16_t _count_y = 0;

@@ -26,6 +26,7 @@
 #include <cstring>
 #include <algorithm>
 #include <iterator>
+#include "driver/gpio.h"
 
 #define SCAN 1
 
@@ -630,6 +631,10 @@ void BTKeyboard::bt_gap_event_handler(esp_bt_gap_cb_event_t event, esp_bt_gap_cb
   }
   case ESP_BT_GAP_KEY_NOTIF_EVT:
     ESP_LOGV(TAG, "BT GAP KEY_NOTIF passkey:%d", param->key_notif.passkey);
+    gpio_set_level(GPIO_NUM_2, 1);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    gpio_set_level(GPIO_NUM_2, 0);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
     if (bt_keyboard->pairing_handler != nullptr)
       (*bt_keyboard->pairing_handler)(param->key_notif.passkey);
     break;
@@ -813,6 +818,10 @@ void BTKeyboard::ble_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap
     // The app will receive this evt when the IO has Output capability and the peer device IO has Input capability.
     // Show the passkey number to the user to input it in the peer device.
     ESP_LOGV(TAG, "BLE GAP PASSKEY_NOTIF passkey:%d", param->ble_security.key_notif.passkey);
+    gpio_set_level(GPIO_NUM_2, 1);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+    gpio_set_level(GPIO_NUM_2, 0);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
     if (bt_keyboard->pairing_handler != nullptr)
       (*bt_keyboard->pairing_handler)(param->ble_security.key_notif.passkey);
     break;
@@ -967,11 +976,6 @@ bool BTKeyboard::devices_scan(int seconds_wait_time)
     ESP_LOGE(TAG, "esp_ble_get_bond_device_list failed");
     numBonded = 0;
   }
-
-  if (numBonded > 0)
-  {
-    ESP_LOGI(TAG, "Last bonded device: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(dev_list[0].bd_addr)); // last one is number 0 (as of ESP v5.0.1)
-  }
   // start scan for HID devices
 
   esp_hid_scan(seconds_wait_time, &results_len, &results);
@@ -983,8 +987,7 @@ bool BTKeyboard::devices_scan(int seconds_wait_time)
   {
     ESP_LOGV(TAG, "Checking if bonded started...");
     esp_hid_scan_result_t *r = results;
-    esp_hid_scan_result_t connectionRestore;
-    esp_hid_scan_result_t *cr = &connectionRestore;
+    esp_hid_scan_result_t *cr = NULL;
     esp_hid_scan_result_t *rc = NULL;
     bool isLastBonded = false;
 
@@ -1394,11 +1397,14 @@ void BTKeyboard::mouse_handle(uint8_t *report_data, std::pair<esp_hidh_dev_t *, 
   mouse.mouse_w = (int8_t)getBits(report_data, mouse_reports[*key_pair].mouse_w_bit_index, mouse_reports[*key_pair].mouse_w_bit_lenght);
   mouse.mouse_buttons = (uint8_t)getBits(report_data, mouse_reports[*key_pair].mouse_buttons_bit_index, mouse_reports[*key_pair].mouse_buttons_amount); // only a single byte for mouse buttons is supported (3 mouse buttons will be used later only)
 
-  // Test logging for HID mouse activity: movement, wheel and button transitions.
+#if defined(_ESP32_PS2DEV_DEBUG_)
+  // Mouse activity logging is debug-only to avoid flooding the console and
+  // competing with the PS/2 timing path during normal use.
   if ((mouse.mouse_x != 0) || (mouse.mouse_y != 0) || (mouse.mouse_w != 0))
   {
-    ESP_LOGI(TAG, "[MOUSE] move x=%d y=%d wheel=%d buttons=0x%02x", mouse.mouse_x, mouse.mouse_y, mouse.mouse_w, mouse.mouse_buttons);
+    ESP_LOGD(TAG, "[MOUSE] move x=%d y=%d wheel=%d buttons=0x%02x", mouse.mouse_x, mouse.mouse_y, mouse.mouse_w, mouse.mouse_buttons);
   }
+#endif
 
   if (!mouse_log_initialized)
   {
@@ -1410,17 +1416,21 @@ void BTKeyboard::mouse_handle(uint8_t *report_data, std::pair<esp_hidh_dev_t *, 
   {
     const uint8_t changed = (uint8_t)(mouse.mouse_buttons ^ prev_buttons);
 
+#if defined(_ESP32_PS2DEV_DEBUG_)
     if (changed & 0x01)
-      ESP_LOGI(TAG, "[MOUSE] LEFT %s", (mouse.mouse_buttons & 0x01) ? "DOWN" : "UP");
+      ESP_LOGD(TAG, "[MOUSE] LEFT %s", (mouse.mouse_buttons & 0x01) ? "DOWN" : "UP");
     if (changed & 0x02)
-      ESP_LOGI(TAG, "[MOUSE] RIGHT %s", (mouse.mouse_buttons & 0x02) ? "DOWN" : "UP");
+      ESP_LOGD(TAG, "[MOUSE] RIGHT %s", (mouse.mouse_buttons & 0x02) ? "DOWN" : "UP");
     if (changed & 0x04)
-      ESP_LOGI(TAG, "[MOUSE] MIDDLE %s", (mouse.mouse_buttons & 0x04) ? "DOWN" : "UP");
+      ESP_LOGD(TAG, "[MOUSE] MIDDLE %s", (mouse.mouse_buttons & 0x04) ? "DOWN" : "UP");
+#endif
 
     prev_buttons = mouse.mouse_buttons;
   }
 
+#if defined(_ESP32_PS2DEV_DEBUG_)
   ESP_LOGD(TAG, "Mouse passed to MAIN: B: %u X: %d Y: %d W: %d", mouse.mouse_buttons, mouse.mouse_x, mouse.mouse_y, mouse.mouse_w);
+#endif
   xQueueSend(event_queue_MOUSE, &mouse, 0);
 }
 
@@ -1504,42 +1514,33 @@ void BTKeyboard::push_key(uint8_t *keys, uint8_t size, std::pair<esp_hidh_dev_t 
     uint8_t out = 0;
     inf.modifier = (size > 0) ? (KeyModifier)keys[0] : (KeyModifier)0;
 
-    // Scan all bytes 1..15 for keys
+    // 16-byte NKRO keyboard reports are bitmap-based: each bit is one usage.
+    // Scan all bytes 1..15 and decode every set bit into a HID usage.
     for (int byte_idx = 1; (byte_idx < size) && (out < MAX_KEY_COUNT); byte_idx++)
     {
       uint8_t byte_val = keys[byte_idx];
       if (byte_val == 0)
         continue;
 
-      // Each byte can carry multiple keys (bitmap) OR single key (HID code)
-      // Try bitmap first: if single-bit pattern, decode with offset
-      if ((byte_val & (byte_val - 1)) == 0)
+      for (uint8_t bit = 0; (bit < 8) && (out < MAX_KEY_COUNT); bit++)
       {
-        // Single bit set - bitmap interpretation
-        for (uint8_t bit = 0; bit < 8; bit++)
+        if (byte_val & (1U << bit))
         {
-          if (byte_val & (1U << bit))
+          uint16_t usage = (uint16_t)(((byte_idx - 1) * 8) + bit);
+          if (usage >= 0x04 && usage <= 0xE7)
           {
-            uint16_t usage = (uint16_t)(((byte_idx - 1) * 8) + bit);
-            if (usage >= 0x04 && usage <= 0xE7)
+            bool dup = false;
+            for (int j = 0; j < out; j++)
             {
-              inf.keys[out++] = (uint8_t)usage;
+              if (inf.keys[j] == usage)
+              {
+                dup = true;
+                break;
+              }
             }
-            break;
+            if (!dup)
+              inf.keys[out++] = (uint8_t)usage;
           }
-        }
-      }
-      else
-      {
-        // Multi-bit or direct HID: treat as direct HID code if valid range
-        if (byte_val >= 0x04 && byte_val <= 0xE7)
-        {
-          bool dup = false;
-          for (int j = 0; j < out; j++)
-            if (inf.keys[j] == byte_val)
-              dup = true;
-          if (!dup)
-            inf.keys[out++] = byte_val;
         }
       }
     }

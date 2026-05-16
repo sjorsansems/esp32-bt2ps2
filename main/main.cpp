@@ -27,6 +27,19 @@ const int KB_DATA_PIN = 23;
 const int MOUSE_CLK_PIN = 26; // VERY IMPORTANT: Not all pins are suitable out-of-the-box. Check README for more info!
 const int MOUSE_DATA_PIN = 25;
 
+// Mouse translation tuning for PS/2 output.
+// These values are conservative so DOS and Windows 95 stay usable.
+const int MOUSE_TRANSLATION_DIVISOR = 12;
+const int MOUSE_TRANSLATION_MIN_EMIT = 2;
+const int MOUSE_TRANSLATION_DEADZONE = 1;
+const int MOUSE_TRANSLATION_MAX_STEP = 2;
+const uint32_t MOUSE_TRANSLATION_FLUSH_INTERVAL_MS = 8;
+const uint32_t MOUSE_TRANSLATION_IDLE_RESET_MS = 24;
+
+// Dedicated pairing button input (active low with internal pull-up).
+// Use a momentary button to GND.
+const int PAIRING_BUTTON_PIN = 27;
+
 static const int SERIAL_MOUSE_RS232_RTS = 15; // If you're not using serial, do not connect anything to this pin, otherwise PS/2 may not work if pulled down
 static const int SERIAL_MOUSE_RS232_RX = 4;
 
@@ -173,9 +186,14 @@ static void IRAM_ATTR pairing_scan(void *arg = NULL)
     if (BTKeyboard::isConnected)
     {
         ESP_LOGI(TAG, "Pairing requested but keyboard is already connected.");
+        for (int i = 0; i < 3; i++) {
+            gpio_set_level(GPIO_NUM_2, 1);
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+            gpio_set_level(GPIO_NUM_2, 0);
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+        }
         pairingRequested = false;
         pairingAborted = false;
-        gpio_set_level(GPIO_NUM_2, 1);
         vTaskDelete(NULL);
     }
 
@@ -192,22 +210,11 @@ static void IRAM_ATTR pairing_scan(void *arg = NULL)
     while (!BTKeyboard::isConnected && !pairingAborted)
     {
         bt_keyboard.devices_scan();
-        if (BTKeyboard::btFound)
-        {
-            BTKeyboard::btFound = false;
-            for (int i = 0; i < 60; i++)
-            {
-                if (BTKeyboard::isConnected)
-                    break;
-                ESP_LOGI(TAG, "Waiting for BT Classic manual code entry...");
-                vTaskDelay(1000 / portTICK_PERIOD_MS);
-            }
-        }
-        else
-        {
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            ESP_LOGI(TAG, "Pairing re-scan...");
-        }
+        gpio_set_level(GPIO_NUM_2, 1);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        gpio_set_level(GPIO_NUM_2, 0);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        // ...existing code...
     } // Required to discover new keyboards and for pairing
       // Default duration is 5 seconds
 
@@ -252,9 +259,9 @@ extern "C"
         io_conf.pin_bit_mask = (1ULL << MOUSE_CLK_PIN);
         gpio_config(&io_conf);
 
-        io_conf.intr_type = GPIO_INTR_DISABLE; // PAIRING BUTTON CONFIGURATION (GPIO 0 OR "BOOT BUTTON")
+        io_conf.intr_type = GPIO_INTR_DISABLE; // PAIRING BUTTON CONFIGURATION (dedicated GPIO)
         io_conf.mode = GPIO_MODE_INPUT;
-        io_conf.pin_bit_mask = (1ULL << GPIO_NUM_0);
+        io_conf.pin_bit_mask = (1ULL << PAIRING_BUTTON_PIN);
         io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
         io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
         gpio_config(&io_conf);
@@ -273,11 +280,9 @@ extern "C"
         io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
         gpio_config(&io_conf);
 
-        // init PS/2 emulation first
+        init_gpio_num_2(); // Initialize GPIO_NUM_2 for LED notifications
 
-        gpio_reset_pin(GPIO_NUM_2);                       // using built-in LED for notifications
-        gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT); // Set the GPIO as a push/pull output
-        gpio_set_level(GPIO_NUM_2, 1);
+        // init PS/2 emulation first
 
         mouse.begin(true); // true parameter indicates we want to recover previous mouse state from NVS
         keyboard.begin();
@@ -652,7 +657,7 @@ extern "C"
                 {
                     gpio_set_level(GPIO_NUM_2, 1); // LED up for every key cycle
 
-                    if (!gpio_get_level(GPIO_NUM_0)) // Pairing request via BOOT button (GPIO_0) check
+                    if (!gpio_get_level((gpio_num_t)PAIRING_BUTTON_PIN)) // Pairing request via dedicated pairing button
                     {
                         pairingRequested = true;
                         start_pairing_scan();
@@ -668,10 +673,10 @@ extern "C"
                     {
                         gpio_set_level(GPIO_NUM_2, 1); // LED up while pairin is active but abort is requested
                     }
-                    if (!gpio_get_level(GPIO_NUM_0)) // Pairing request via BOOT button (GPIO_0) check
+                    if (!gpio_get_level((gpio_num_t)PAIRING_BUTTON_PIN)) // Hold dedicated pairing button to abort pairing
                     {
                         vTaskDelay(2000 / portTICK_PERIOD_MS);
-                        if (!gpio_get_level(GPIO_NUM_0))
+                        if (!gpio_get_level((gpio_num_t)PAIRING_BUTTON_PIN))
                             pairingAborted = true; // User pressed and hold the pairing button for 2sec while it was active. This is an abort request!
                     }
                 }
@@ -737,7 +742,90 @@ extern "C"
 void mouse_task(void *arg)
 {
     BTKeyboard::Mouse_Control infoMouse;    // freshly received mouse report
-    BTKeyboard::Mouse_Control infoMouseBuf; // currently pressed mouse report
+    BTKeyboard::Mouse_Control infoMouseBuf = {}; // last processed mouse report
+    int32_t mouse_accum_x = 0;
+    int32_t mouse_accum_y = 0;
+    int32_t mouse_accum_w = 0;
+    TickType_t last_mouse_emit = xTaskGetTickCount();
+    TickType_t last_mouse_input = last_mouse_emit;
+
+    auto abs32 = [](int32_t value) -> int32_t
+    {
+        return (value < 0) ? -value : value;
+    };
+
+    auto clamp_step = [](int32_t value) -> int32_t
+    {
+        if (value > MOUSE_TRANSLATION_MAX_STEP)
+        {
+            return MOUSE_TRANSLATION_MAX_STEP;
+        }
+        if (value < -MOUSE_TRANSLATION_MAX_STEP)
+        {
+            return -MOUSE_TRANSLATION_MAX_STEP;
+        }
+        return value;
+    };
+
+    auto flush_motion = [&](bool force) -> void
+    {
+        TickType_t now = xTaskGetTickCount();
+        if (!force && (now - last_mouse_emit) < pdMS_TO_TICKS(MOUSE_TRANSLATION_FLUSH_INTERVAL_MS))
+        {
+            return;
+        }
+
+        int32_t x = mouse_accum_x;
+        int32_t y = mouse_accum_y;
+        int32_t w = mouse_accum_w;
+
+        if (x == 0 && y == 0 && w == 0)
+        {
+            return;
+        }
+
+        if (abs32(x) <= MOUSE_TRANSLATION_DEADZONE)
+        {
+            x = 0;
+        }
+        if (abs32(y) <= MOUSE_TRANSLATION_DEADZONE)
+        {
+            y = 0;
+        }
+        if (abs32(w) <= MOUSE_TRANSLATION_DEADZONE)
+        {
+            w = 0;
+        }
+
+        int32_t emit_x = clamp_step(x / MOUSE_TRANSLATION_DIVISOR);
+        int32_t emit_y = clamp_step(y / MOUSE_TRANSLATION_DIVISOR);
+        int32_t emit_w = clamp_step(w / MOUSE_TRANSLATION_DIVISOR);
+
+        if (emit_x == 0 && x != 0 && abs32(x) >= MOUSE_TRANSLATION_MIN_EMIT)
+        {
+            emit_x = (x > 0) ? 1 : -1;
+        }
+        if (emit_y == 0 && y != 0 && abs32(y) >= MOUSE_TRANSLATION_MIN_EMIT)
+        {
+            emit_y = (y > 0) ? 1 : -1;
+        }
+        if (emit_w == 0 && w != 0 && abs32(w) >= MOUSE_TRANSLATION_MIN_EMIT)
+        {
+            emit_w = (w > 0) ? 1 : -1;
+        }
+
+        if (emit_x == 0 && emit_y == 0 && emit_w == 0)
+        {
+            return;
+        }
+
+        mouse_accum_x -= emit_x * MOUSE_TRANSLATION_DIVISOR;
+        mouse_accum_y -= emit_y * MOUSE_TRANSLATION_DIVISOR;
+        mouse_accum_w -= emit_w * MOUSE_TRANSLATION_DIVISOR;
+
+        mouse.move((int16_t)emit_x, (int16_t)emit_y, (int8_t)emit_w);
+        last_mouse_emit = now;
+    };
 
     while (true)
     {
@@ -754,11 +842,21 @@ void mouse_task(void *arg)
             }
             else
             {
-                mouse.move(infoMouse.mouse_x, infoMouse.mouse_y, infoMouse.mouse_w);
+                // Invert X here to match what DOS/Win95 users expect from the PS/2 cursor.
+                mouse_accum_x -= infoMouse.mouse_x;
+                mouse_accum_y += infoMouse.mouse_y;
+                mouse_accum_w += infoMouse.mouse_w;
+                last_mouse_input = xTaskGetTickCount();
+
+                flush_motion(false);
 
                 // KEY SECTION (always tested)
                 if ((infoMouse.mouse_buttons) != (infoMouseBuf.mouse_buttons))
                 {
+                    // Flush any pending motion before button state changes so the click
+                    // lands cleanly in the same place the user expected.
+                    flush_motion(true);
+
                     if ((infoMouse.mouse_buttons & 0b1) != (infoMouseBuf.mouse_buttons & 0b1)) // change on first button?
                     {
                         if (infoMouse.mouse_buttons & 0b1)
@@ -810,6 +908,22 @@ void mouse_task(void *arg)
             }
 
             infoMouseBuf = infoMouse; // Now all the keys are handled, we save the state
+        }
+        else
+        {
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_mouse_input) > pdMS_TO_TICKS(MOUSE_TRANSLATION_IDLE_RESET_MS))
+            {
+                // Drop stale motion so a fast flick does not keep drifting after release.
+                mouse_accum_x = 0;
+                mouse_accum_y = 0;
+                mouse_accum_w = 0;
+            }
+            else
+            {
+                flush_motion(false);
+            }
+            vTaskDelay(1);
         }
     }
 }
